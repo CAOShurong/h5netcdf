@@ -2151,6 +2151,102 @@ def test_create_invalid_netcdf_catch_error(tmp_local_or_remote_netcdf):
         assert repr(f.dimensions) == "<h5netcdf.Dimensions: >"
 
 
+def test_create_variable_error_rolls_back_inferred_dimensions(tmp_local_netcdf):
+    # see https://github.com/h5netcdf/h5netcdf/issues/138
+    with h5netcdf.File(tmp_local_netcdf, "w") as f:
+        with raises(ValueError):
+            f.create_variable(
+                "test",
+                ("x", "y"),
+                data=np.ones((2, 2)),
+                chunks=(3, 3),
+            )
+
+        assert not f.dimensions
+        assert not f.variables
+        assert not list(f._h5group)
+
+    with h5netcdf.File(tmp_local_netcdf, "r") as f:
+        assert not f.dimensions
+        assert not f.variables
+        assert not list(f._h5group)
+
+    with h5netcdf.File(tmp_local_netcdf, "a") as f:
+        variable = f.create_variable(
+            "test", ("x", "y"), data=np.ones((2, 2)), chunks=(2, 2)
+        )
+        assert variable.shape == (2, 2)
+
+    with h5netcdf.File(tmp_local_netcdf, "r") as f:
+        assert f["test"].shape == (2, 2)
+
+
+def test_create_coordinate_error_restores_dimension_scale(tmp_local_netcdf):
+    # see https://github.com/h5netcdf/h5netcdf/issues/138
+    with h5netcdf.File(tmp_local_netcdf, "w") as f:
+        f.dimensions["x"] = 2
+        dependent = f.create_variable("dependent", ("x",), data=[1, 2])
+
+        with raises(ValueError):
+            f.create_variable("x", ("x",), data=[3, 4], chunks=(3,))
+
+        assert f.dimensions["x"].size == 2
+        assert dependent.dimensions == ("x",)
+
+    with h5netcdf.File(tmp_local_netcdf, "r") as f:
+        assert f.dimensions["x"].size == 2
+        assert f["dependent"].dimensions == ("x",)
+        assert "x" not in f.variables
+
+    with h5netcdf.File(tmp_local_netcdf, "a") as f:
+        coordinate = f.create_variable("x", ("x",), data=[3, 4], chunks=(2,))
+        assert coordinate[:].tolist() == [3, 4]
+        assert f["dependent"].dimensions == ("x",)
+
+    with h5netcdf.File(tmp_local_netcdf, "r") as f:
+        assert f["x"][:].tolist() == [3, 4]
+        assert f["dependent"].dimensions == ("x",)
+
+
+def test_create_variable_error_detaches_existing_dimension_scale(
+    tmp_local_netcdf, monkeypatch
+):
+    # see https://github.com/h5netcdf/h5netcdf/issues/138
+    with h5netcdf.File(tmp_local_netcdf, "w") as f:
+        f.dimensions["x"] = 2
+
+        def fail_to_attach_coords(variable):
+            raise RuntimeError("failed after attaching dimension scales")
+
+        with monkeypatch.context() as patch:
+            patch.setattr(f._variable_cls, "_attach_coords", fail_to_attach_coords)
+            with raises(RuntimeError, match="failed after attaching dimension scales"):
+                f.create_variable("broken", ("x",), data=[1, 2])
+
+        assert "broken" not in f.variables
+        assert "broken" not in f._h5group
+        assert not f.dimensions["x"]._scale_refs
+
+        variable = f.create_variable("broken", ("x",), data=[1, 2])
+        assert variable[:].tolist() == [1, 2]
+
+
+def test_duplicate_coordinate_error_keeps_existing_variable(tmp_local_netcdf):
+    with h5netcdf.File(tmp_local_netcdf, "w") as f:
+        f.dimensions["x"] = 2
+        coordinate = f.create_variable("x", ("x",), data=[1, 2])
+
+        with raises(ValueError, match="name already exists"):
+            f.create_variable("x", ("x",), data=[3, 4])
+
+        assert coordinate[:].tolist() == [1, 2]
+        assert coordinate.dimensions == ("x",)
+
+    with h5netcdf.File(tmp_local_netcdf, "r") as f:
+        assert f["x"][:].tolist() == [1, 2]
+        assert f["x"].dimensions == ("x",)
+
+
 @requires_netCDF4
 def test_dimensions_in_parent_groups(tmpdir, local_backend):
     import netCDF4

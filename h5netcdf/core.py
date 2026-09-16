@@ -1300,6 +1300,91 @@ class Group(Mapping):
         chunking_heuristic,
         **kwargs,
     ):
+        # Variable creation can infer dimensions and replace a dimension scale before
+        # the backend validates all dataset options. Keep enough state to make a
+        # caught backend error atomic from both the mapping and HDF5 perspectives.
+        dimension_names = set(self._dimensions)
+        variable_names = set(self._variables._objects)
+        h5object_names = set(self._h5group)
+        max_dim_id = self._root._max_dim_id
+
+        dimension_scale = None
+        if (
+            name in self._dimensions
+            and name in dimensions
+            and not (len(dimensions) > 1 and dimensions[0] != name)
+            and name in self._h5group
+            and _netcdf_dimension_but_not_variable(self._h5group[name])
+        ):
+            dimension = self._dimensions[name]
+            dimension_scale = (
+                dimension,
+                dimension._scale_refs,
+                dimension._h5ds.attrs.get("_Netcdf4Dimid", None),
+                dimension._h5ds.shape,
+            )
+
+        try:
+            return self._create_child_variable_unchecked(
+                name,
+                dimensions,
+                dtype,
+                data,
+                fillvalue,
+                chunks,
+                chunking_heuristic,
+                **kwargs,
+            )
+        except Exception:
+            new_variables = set(self._variables._objects) - variable_names
+            for variable_name in new_variables:
+                variable = self._variables._objects[variable_name]
+                if variable is not None and variable_name in self._h5group:
+                    for axis, dimension_name in enumerate(variable.dimensions):
+                        try:
+                            scale = self._all_dimensions[dimension_name]._h5ds
+                            variable._h5ds.dims[axis].detach_scale(scale)
+                        except (KeyError, RuntimeError, ValueError):
+                            pass
+                self._variables._objects.pop(variable_name)
+
+            for h5object_name in set(self._h5group) - h5object_names:
+                del self._h5group[h5object_name]
+
+            for dimension_name in set(self._dimensions) - dimension_names:
+                self._dimensions._objects.pop(dimension_name)
+
+            if dimension_scale is not None:
+                dimension, refs, dimid, shape = dimension_scale
+                needs_restore = name not in self._h5group or not (
+                    _netcdf_dimension_but_not_variable(self._h5group[name])
+                )
+                if needs_restore:
+                    if name in self._h5group:
+                        try:
+                            dimension._detach_scale()
+                        except (KeyError, RuntimeError, ValueError):
+                            pass
+                        del self._h5group[name]
+                    dimension._create_scale(dimid=dimid)
+                    if dimension._h5ds.shape != shape:
+                        dimension._h5ds.resize(shape)
+                    dimension._attach_scale(refs)
+
+            self._root._max_dim_id = max_dim_id
+            raise
+
+    def _create_child_variable_unchecked(
+        self,
+        name,
+        dimensions,
+        dtype,
+        data,
+        fillvalue,
+        chunks,
+        chunking_heuristic,
+        **kwargs,
+    ):
         if name in self:
             raise ValueError(
                 f"unable to create variable {name!r} (name already exists)"
