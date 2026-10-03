@@ -20,6 +20,7 @@ from .utils import (
     _create_enum_dataset,
     _create_enum_dataset_attribute,
     _create_string_attribute,
+    _CreationTransaction,
 )
 
 try:
@@ -453,13 +454,17 @@ class BaseVariable(BaseObject):
             dims.append(name)
         return tuple(dims)
 
-    def _attach_dim_scales(self):
+    def _attach_dim_scales(self, _undo=None):
         """Attach dimension scales"""
         for n, dim in enumerate(self.dimensions):
             # find and attach dimensions also in parent groups
-            self._h5ds.dims[n].attach_scale(self._parent._all_dimensions[dim]._h5ds)
+            dimension = self._parent._all_dimensions[dim]
+            axis = self._h5ds.dims[n]
+            if _undo is not None:
+                _undo.scale_attachment(axis, dimension)
+            axis.attach_scale(dimension._h5ds)
 
-    def _attach_coords(self):
+    def _attach_coords(self, _undo=None):
         dims = self.dimensions
         # find dimensions also in parent groups
         coord_ids = np.array(
@@ -469,15 +474,19 @@ class BaseVariable(BaseObject):
         # add _Netcdf4Coordinates for multi-dimensional coordinate variables
         # or for (one-dimensional) coordinates
         if len(coord_ids) >= 1:
+            if _undo is not None:
+                _undo.attribute(self._h5ds.attrs, "_Netcdf4Coordinates")
             self._h5ds.attrs["_Netcdf4Coordinates"] = coord_ids
 
-    def _ensure_dim_id(self):
+    def _ensure_dim_id(self, _undo=None):
         """Set _Netcdf4Dimid"""
         # set _Netcdf4Dimid, use id of first dimension
         # netCDF4 does this when the first variable's data is written
         if self.dimensions and not self._h5ds.attrs.get("_Netcdf4Dimid", False):
             dim = self._parent._all_h5groups[self.dimensions[0]]
             if "_Netcdf4Dimid" in dim.attrs:
+                if _undo is not None:
+                    _undo.attribute(self._h5ds.attrs, "_Netcdf4Dimid")
                 self._h5ds.attrs["_Netcdf4Dimid"] = dim.attrs["_Netcdf4Dimid"]
 
     def _maybe_resize_dimensions(self, key, value):
@@ -532,12 +541,15 @@ class BaseVariable(BaseObject):
         if self._h5ds.shape != new_shape:
             self._h5ds.resize(new_shape)
 
-    def _add_fillvalue(self, fillvalue):
+    def _add_fillvalue(self, fillvalue, _undo=None):
         """Add _FillValue attribute.
 
         This method takes care of adding fillvalue with the wanted
         variable dtype.
         """
+
+        if _undo is not None:
+            _undo.attribute(self._h5ds.attrs, "_FillValue")
 
         # trying to create correct type of fillvalue
         if self.dtype is str:
@@ -1300,32 +1312,10 @@ class Group(Mapping):
         chunking_heuristic,
         **kwargs,
     ):
-        # Variable creation can infer dimensions and replace a dimension scale before
-        # the backend validates all dataset options. Keep enough state to make a
-        # caught backend error atomic from both the mapping and HDF5 perspectives.
-        dimension_names = set(self._dimensions)
-        variable_names = set(self._variables._objects)
-        h5object_names = set(self._h5group)
-        max_dim_id = self._root._max_dim_id
-
-        dimension_scale = None
-        if (
-            name in self._dimensions
-            and name in dimensions
-            and not (len(dimensions) > 1 and dimensions[0] != name)
-            and name in self._h5group
-            and _netcdf_dimension_but_not_variable(self._h5group[name])
-        ):
-            dimension = self._dimensions[name]
-            dimension_scale = (
-                dimension,
-                dimension._scale_refs,
-                dimension._h5ds.attrs.get("_Netcdf4Dimid", None),
-                dimension._h5ds.shape,
-            )
-
-        try:
-            return self._create_child_variable_unchecked(
+        # Each mutating helper registers its inverse before the operation. ExitStack
+        # runs every inverse in reverse order even if another inverse raises.
+        with _CreationTransaction() as undo:
+            variable = self._create_child_variable_unchecked(
                 name,
                 dimensions,
                 dtype,
@@ -1333,46 +1323,11 @@ class Group(Mapping):
                 fillvalue,
                 chunks,
                 chunking_heuristic,
+                _undo=undo,
                 **kwargs,
             )
-        except Exception:
-            new_variables = set(self._variables._objects) - variable_names
-            for variable_name in new_variables:
-                variable = self._variables._objects[variable_name]
-                if variable is not None and variable_name in self._h5group:
-                    for axis, dimension_name in enumerate(variable.dimensions):
-                        try:
-                            scale = self._all_dimensions[dimension_name]._h5ds
-                            variable._h5ds.dims[axis].detach_scale(scale)
-                        except (KeyError, RuntimeError, ValueError):
-                            pass
-                self._variables._objects.pop(variable_name)
-
-            for h5object_name in set(self._h5group) - h5object_names:
-                del self._h5group[h5object_name]
-
-            for dimension_name in set(self._dimensions) - dimension_names:
-                self._dimensions._objects.pop(dimension_name)
-
-            if dimension_scale is not None:
-                dimension, refs, dimid, shape = dimension_scale
-                needs_restore = name not in self._h5group or not (
-                    _netcdf_dimension_but_not_variable(self._h5group[name])
-                )
-                if needs_restore:
-                    if name in self._h5group:
-                        try:
-                            dimension._detach_scale()
-                        except (KeyError, RuntimeError, ValueError):
-                            pass
-                        del self._h5group[name]
-                    dimension._create_scale(dimid=dimid)
-                    if dimension._h5ds.shape != shape:
-                        dimension._h5ds.resize(shape)
-                    dimension._attach_scale(refs)
-
-            self._root._max_dim_id = max_dim_id
-            raise
+            undo.pop_all()
+            return variable
 
     def _create_child_variable_unchecked(
         self,
@@ -1383,6 +1338,7 @@ class Group(Mapping):
         fillvalue,
         chunks,
         chunking_heuristic,
+        _undo,
         **kwargs,
     ):
         if name in self:
@@ -1412,8 +1368,7 @@ class Group(Mapping):
                 #  - they are given in dimensions
                 #  - it's not a coordinate variable, they will get special handling later
                 if d not in self._all_dimensions and d in dimensions and d is not name:
-                    # calls _create_dimension
-                    self.dimensions[d] = s
+                    self._dimensions._create(d, s, _undo=_undo)
 
         # coordinate variable
         need_dim_adding = False
@@ -1458,9 +1413,19 @@ class Group(Mapping):
         refs = None
         dimid = None
         if h5name in self._dimensions and h5name in self._h5group:
-            refs = self._dimensions[name]._scale_refs
-            dimid = self._dimensions[name]._h5ds.attrs.get("_Netcdf4Dimid", None)
-            self._dimensions[name]._detach_scale()
+            dimension = self._dimensions[name]
+            refs = dimension._scale_refs
+            dimid = dimension._h5ds.attrs.get("_Netcdf4Dimid", None)
+            dimension._detach_scale(_undo=_undo)
+            # Save only the object being removed, not the group's overall state.
+            _undo.callback(
+                dimension._restore_scale,
+                dimension._h5ds.shape,
+                dimension._h5ds.maxshape,
+                dimension._h5ds.chunks,
+                dimension._h5ds.dtype,
+                dict(dimension._h5ds.attrs),
+            )
             del self._h5group[name]
 
         kwargs.update(dict(track_order=self._parent._track_order))
@@ -1469,6 +1434,7 @@ class Group(Mapping):
         fillvalue, h5fillvalue = _check_fillvalue(self, fillvalue, dtype)
 
         # create hdf5 variable
+        _undo.dataset(self._h5group, h5name)
         # for classic format string types write with low level API
         if (
             self._root._format == "NETCDF4_CLASSIC"
@@ -1494,25 +1460,26 @@ class Group(Mapping):
 
         # create variable class instance
         variable = self._variable_cls(self, h5name, dimensions)
+        _undo.callback(self._variables._objects.pop, h5name, None)
         self._variables[h5name] = variable
 
         # need to put coordinate variable into dimensions
         if need_dim_adding:
-            self._dimensions.add(name)
+            self._dimensions.add(name, _undo=_undo)
 
         # Re-create dim-scale and re-attach references to coordinate variable.
         if name in self._all_dimensions and h5name in self._h5group:
             if dimid is not None:
-                self._all_dimensions[name]._create_scale(dimid=dimid)
+                self._all_dimensions[name]._create_scale(dimid=dimid, _undo=_undo)
             if refs is not None:
-                self._all_dimensions[name]._attach_scale(refs)
+                self._all_dimensions[name]._attach_scale(refs, _undo=_undo)
             # re-attach coords for dimension scales
-            variable._attach_coords()
+            variable._attach_coords(_undo=_undo)
 
         # In case of data variables attach dim_scales and coords.
         if name in self.variables and h5name not in self._dimensions:
-            variable._attach_dim_scales()
-            variable._attach_coords()
+            variable._attach_dim_scales(_undo=_undo)
+            variable._attach_coords(_undo=_undo)
 
         # This is a bit of a hack, netCDF4 attaches _Netcdf4Dimid to every variable
         # when a variable is first written to, after variable creation.
@@ -1521,11 +1488,11 @@ class Group(Mapping):
             None not in maxshape
             and len(variable._h5ds.attrs.get("_Netcdf4Coordinates", [])) >= 1
         ):
-            variable._ensure_dim_id()
+            variable._ensure_dim_id(_undo=_undo)
 
         # add fillvalue attribute to variable
         if fillvalue is not None:
-            variable._add_fillvalue(fillvalue)
+            variable._add_fillvalue(fillvalue, _undo=_undo)
 
         return variable
 
